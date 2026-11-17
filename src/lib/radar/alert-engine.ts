@@ -33,6 +33,12 @@ export const DEFAULT_ALERT_CONFIG = {
   fallLowMotionSpeedCms: 8,
   /** Candidate fall post-impact inactivity duration in milliseconds */
   fallLowMotionDurationMs: 3_000,
+  /** Candidate fall speed that cancels a pending fall candidate (cm/s) */
+  fallRecoverySpeedCms: 20,
+  /** Maximum distance a candidate may drift after the impact (mm) */
+  fallPostImpactMaxDisplacementMm: 600,
+  /** Time allowed to observe sustained low motion after an impact (ms) */
+  fallEvaluationWindowMs: 8_000,
   /** Pacing: number of direction reversals within window */
   pacingReversalsThreshold: 3,
   /** Target stale timeout in milliseconds (disappearance) */
@@ -98,6 +104,7 @@ export interface TargetTrackingState {
   spikeSpeed: number | null;
   spikeTime: number | null;
   spikeCoords: { x: number; y: number; z?: number | undefined } | null;
+  lowMotionStartedAt: number | null;
   fallAlertEmitted: boolean;
 
   // Pacing tracking
@@ -302,6 +309,7 @@ export class AlertEngine {
           spikeSpeed: null,
           spikeTime: null,
           spikeCoords: null,
+          lowMotionStartedAt: null,
           fallAlertEmitted: false,
           lastPacingAlertTime: 0,
           routineAlerted: new Map(),
@@ -898,10 +906,16 @@ export class AlertEngine {
   ) {
     const curSpeed = Math.abs(state.speed_cms);
 
-    // 1. Quality Check: suppress if sensor quality is insufficient
-    if (state.snr !== undefined && state.snr < 10) {
+    const clearFallCandidate = () => {
       state.spikeSpeed = null;
       state.spikeTime = null;
+      state.spikeCoords = null;
+      state.lowMotionStartedAt = null;
+    };
+
+    // 1. Quality Check: suppress if sensor quality is insufficient
+    if (state.snr !== undefined && state.snr < 10) {
+      clearFallCandidate();
       return;
     }
 
@@ -910,37 +924,46 @@ export class AlertEngine {
       state.spikeSpeed = curSpeed;
       state.spikeTime = timestamp;
       state.spikeCoords = { x: state.x_mm, y: state.y_mm, z: state.z_mm };
+      state.lowMotionStartedAt = null;
       return;
     }
 
-    // 3. Post-spike inactivity check
-    if (state.spikeTime && state.spikeSpeed && !state.fallAlertEmitted) {
+    // 3. Post-spike confirmation. A single quiet sample is not enough: the target
+    // must remain close to the impact position and continuously below the low-motion
+    // threshold. This rejects normal fast walking followed by a brief pause.
+    if (state.spikeTime !== null && state.spikeSpeed !== null && !state.fallAlertEmitted) {
       const elapsedSinceSpike = timestamp - state.spikeTime;
+      const spike = state.spikeCoords;
+      const displacementSinceSpike = spike
+        ? Math.hypot(state.x_mm - spike.x, state.y_mm - spike.y)
+        : 0;
 
-      // If target moves normally again (>20 cm/s), it was recovery/walking, not a sustained fall
-      if (curSpeed > 20 && elapsedSinceSpike < this.config.fallLowMotionDurationMs) {
-        state.spikeSpeed = null;
-        state.spikeTime = null;
+      if (
+        elapsedSinceSpike > this.config.fallEvaluationWindowMs ||
+        curSpeed > this.config.fallRecoverySpeedCms ||
+        displacementSinceSpike > this.config.fallPostImpactMaxDisplacementMm
+      ) {
+        clearFallCandidate();
         return;
       }
 
-      // Check if low motion has persisted for required duration
-      if (
-        curSpeed <= this.config.fallLowMotionSpeedCms &&
-        elapsedSinceSpike >= this.config.fallLowMotionDurationMs
-      ) {
+      if (curSpeed <= this.config.fallLowMotionSpeedCms) {
+        state.lowMotionStartedAt ??= timestamp;
+        const lowMotionDuration = timestamp - state.lowMotionStartedAt;
+
+        if (lowMotionDuration < this.config.fallLowMotionDurationMs) return;
+
         // 4. Floor surface check: suppress if resting on bed or sofa
         const onFurniture = isTargetOnRestingFurniture(rx, ry, objects, zones);
         if (onFurniture) {
-          state.spikeSpeed = null;
-          state.spikeTime = null;
+          clearFallCandidate();
           return;
         }
 
         // Trigger Candidate Fall alert
         state.fallAlertEmitted = true;
         const spikeVal = state.spikeSpeed;
-        const durationSec = (elapsedSinceSpike / 1000).toFixed(1);
+        const durationSec = (lowMotionDuration / 1000).toFixed(1);
 
         alerts.push({
           room_id: this.room.id,
@@ -970,14 +993,17 @@ export class AlertEngine {
               "Candidate fall indicator is strictly experimental and rule-based. It is not a certified medical alarm, emergency response, or certified life-safety monitoring service. Micro-radar does not verify posture or consciousness.",
           },
         });
+      } else {
+        // Motion below the recovery threshold but above the inactivity threshold
+        // interrupts the confirmation window without treating the target as recovered.
+        state.lowMotionStartedAt = null;
       }
     }
 
     // Reset fall alert if target recovers and resumes walking
     if (state.fallAlertEmitted && curSpeed > 35) {
       state.fallAlertEmitted = false;
-      state.spikeSpeed = null;
-      state.spikeTime = null;
+      clearFallCandidate();
     }
   }
 

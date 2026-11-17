@@ -488,8 +488,62 @@ describe("Phase 3: Explainable Alerts & Hazard Detection Engine", () => {
     expect(alerts.filter((a) => a.event_type === "candidate_fall")).toHaveLength(0);
   });
 
-  // 15. Virtual/hardware provenance preserved on all generated alert objects
-  it("Criterion 15: preserves virtual and hardware provenance without alteration", () => {
+  // 15. A quiet sample after fast walking is not sustained inactivity.
+  it("Criterion 15: requires uninterrupted low motion after the velocity spike", () => {
+    const engine = new AlertEngine(testRoom, {
+      ...DEFAULT_ALERT_CONFIG,
+      fallVelocitySpikeThresholdCms: 110,
+      fallLowMotionDurationMs: 2_000,
+    });
+    let t = 1_000_000;
+
+    engine.processTargets([{ target_id: 1, x_mm: 0, y_mm: 3000, speed_cms: 130 }], t, true);
+
+    // A brief quiet reading, followed by ordinary movement, must cancel the candidate.
+    t += 500;
+    engine.processTargets([{ target_id: 1, x_mm: 0, y_mm: 3000, speed_cms: 0 }], t, true);
+    t += 500;
+    engine.processTargets([{ target_id: 1, x_mm: 100, y_mm: 3100, speed_cms: 35 }], t, true);
+
+    let alerts: ReturnType<typeof engine.processTargets> = [];
+    for (let i = 0; i < 6; i++) {
+      t += 500;
+      alerts = engine.processTargets(
+        [{ target_id: 1, x_mm: 100, y_mm: 3100, speed_cms: 0 }],
+        t,
+        true,
+      );
+      expect(alerts.filter((a) => a.event_type === "candidate_fall")).toHaveLength(0);
+    }
+  });
+
+  // 16. A tracked target that changes location after a spike is walking, not lying still.
+  it("Criterion 16: rejects a fall candidate that drifts away from the impact location", () => {
+    const engine = new AlertEngine(testRoom, {
+      ...DEFAULT_ALERT_CONFIG,
+      fallVelocitySpikeThresholdCms: 110,
+      fallLowMotionDurationMs: 2_000,
+      fallPostImpactMaxDisplacementMm: 400,
+    });
+    let t = 1_000_000;
+
+    engine.processTargets([{ target_id: 1, x_mm: 0, y_mm: 3000, speed_cms: 130 }], t, true);
+    t += 500;
+    engine.processTargets([{ target_id: 1, x_mm: 700, y_mm: 3000, speed_cms: 0 }], t, true);
+
+    for (let i = 0; i < 6; i++) {
+      t += 500;
+      const alerts = engine.processTargets(
+        [{ target_id: 1, x_mm: 700, y_mm: 3000, speed_cms: 0 }],
+        t,
+        true,
+      );
+      expect(alerts.filter((a) => a.event_type === "candidate_fall")).toHaveLength(0);
+    }
+  });
+
+  // 17. Virtual/hardware provenance preserved on all generated alert objects
+  it("Criterion 17: preserves virtual and hardware provenance without alteration", () => {
     const engine = new AlertEngine(testRoom);
     const t = 1_000_000;
 
